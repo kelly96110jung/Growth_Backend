@@ -4,7 +4,15 @@ from typing import List
 import re
 import json
 
+from .ws_stt import ws_stt_endpoint
+from fastapi import WebSocket
+
 app = FastAPI()
+
+@app.websocket("/ws/stt")
+async def ws_stt(websocket: WebSocket):
+    await ws_stt_endpoint(websocket)
+
 
 # ======================
 # 계약 모델 (schema.md 그대로)

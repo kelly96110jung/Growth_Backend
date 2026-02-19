@@ -47,7 +47,7 @@ def fake_stt_stream(session_id: str) -> Generator[SttEvent, None, None]:
         type="stt",
         payload={
             "is_final": True,
-            "text": "안녕하세요 지금 상담을 시작하겠습니다.",
+            "text": "안녕하세요 지금 상담을 시작하겠습니다??",
             "seq": seq,
         },
     )

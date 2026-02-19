@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import time
-import uuid
 
 
 class SessionState(str, Enum):
@@ -26,7 +25,7 @@ class Session:
 class SessionManager:
     """
     In-memory session manager (no DB).
-    목표: 세션이 절대 터지지 않게, 상태/타임스탬프/seq를 안정적으로 관리.
+    Goals: do not drop session unexpectedly; manage state/timestamps/seq consistently.
     """
 
     def __init__(self) -> None:
@@ -74,3 +73,33 @@ class SessionManager:
         self.touch(session_id)
         return s
 
+    def next_seq(self, session_id: str) -> int:
+        """
+        Increment and return sequence number for the session.
+        """
+        s = self._sessions.get(session_id)
+        if not s:
+            return 0
+        s.seq += 1
+        self.touch(session_id)
+        return s.seq
+
+    def expire_inactive_sessions(self, *, ttl_minutes: int = 20) -> List[str]:
+        """
+        last_activity_ms 기준 ttl_minutes 이상 비활성인 세션을 ENDED로 전환하고,
+        종료된 session_id 목록을 반환한다.
+        """
+        now_ms = int(time.time() * 1000)
+        ttl_ms = ttl_minutes * 60 * 1000
+
+        expired: List[str] = []
+
+        for session_id, s in list(self._sessions.items()):
+            if s.state == SessionState.ENDED:
+                continue
+
+            if now_ms - s.last_activity_ms > ttl_ms:
+                self.end_session(session_id)
+                expired.append(session_id)
+
+        return expired

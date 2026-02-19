@@ -27,6 +27,13 @@ class LifecycleEvent(BaseEvent):
 class WarningEvent(BaseEvent):
     """
     실패 / 불확실 상황 전달용 이벤트
+    (M2에서 translation 실패/불확실 시 사용)
+    payload 예시:
+      {
+        "code": "translation_failed" | "translation_uncertain",
+        "message": "...",
+        "target_lang": "en" | "zh" | None
+      }
     """
     type: Literal["warning"] = "warning"
     payload: Dict[str, Any]
@@ -35,6 +42,11 @@ class WarningEvent(BaseEvent):
 class SttEvent(BaseEvent):
     """
     STT 결과 이벤트 (interim / final)
+    payload 예시:
+      {
+        "text": "...",
+        "is_final": true/false
+      }
     """
     type: Literal["stt"] = "stt"
     payload: Dict[str, Any]
@@ -43,6 +55,26 @@ class SttEvent(BaseEvent):
 class TranslationEvent(BaseEvent):
     """
     번역 결과 이벤트 (ko -> en / zh)
+    ✅ M2 완료 기준을 위해 "항상 JSON으로" 번역 결과를 보내기 위한 이벤트
+
+    payload 예시(성공):
+      {
+        "source_lang": "ko",
+        "target_lang": "en",
+        "stt_text": "원문",
+        "translated_text": "번역문",
+        "ok": true
+      }
+
+    payload 예시(실패/불확실):
+      {
+        "source_lang": "ko",
+        "target_lang": "zh",
+        "stt_text": "원문",
+        "translated_text": "원문",   # 원문 유지
+        "ok": false,
+        "reason": "translation_failed" | "translation_uncertain"
+      }
     """
     type: Literal["translation"] = "translation"
     payload: Dict[str, Any]

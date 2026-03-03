@@ -1,386 +1,203 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from session.fake_stt_stream import fake_stt_stream
-from session.session_manager import SessionManager
-from session.events import TranslationEvent, WarningEvent
-from translate.translator import translate_text
+from app.stt_google_streaming import GoogleStreamingSttBridge
 
 
-# 전역 SessionManager (main.py에서 import되어도 1개만 쓰는 형태)
-session_manager = SessionManager()
+# ✅ 지금 Flutter가 "녹음 끝나고 WAV 한 번에 전송"이면 True 유지
+# 나중에 "쪼개서 실시간 전송"으로 바꾸면 False로 바꾸면 됨
+RECORD_THEN_SEND = True
 
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    s = (s or "").strip()
-    if not s.startswith("{"):
-        return None
+async def _send_text(ws: WebSocket, text: str) -> None:
+    await ws.send_text(text)
+
+
+def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(s)
     except Exception:
         return None
 
 
-def _parse_start_text(msg: str) -> Tuple[str, str]:
-    """
-    "start" or "start:<session_id>" 형태 지원
-    returns: (cmd, session_id)
-    """
-    parts = msg.split(":", 1)
-    cmd = parts[0].strip()
-    sid = parts[1].strip() if len(parts) == 2 and parts[1].strip() else "test-session"
-    return cmd, sid
+def _b64_to_bytes(b64: str) -> bytes:
+    b64 = b64.strip().replace("\n", "").replace("\r", "")
+    return base64.b64decode(b64)
 
 
-def _parse_stop_text(msg: str, fallback_session_id: str) -> Tuple[str, str]:
-    """
-    "stop" or "stop:<session_id>" 형태 지원
-    returns: (cmd, session_id)
-    """
-    parts = msg.split(":", 1)
-    cmd = parts[0].strip()
-    sid = parts[1].strip() if len(parts) == 2 and parts[1].strip() else (fallback_session_id or "test-session")
-    return cmd, sid
+def _make_stt_event(session_id: str, text: str, is_final: bool) -> str:
+    payload = {
+        "type": "stt",
+        "session_id": session_id,
+        "ts": 0,
+        "payload": {"text": text, "is_final": bool(is_final)},
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
-async def _send_text(websocket: WebSocket, payload: str) -> None:
-    await websocket.send_text(payload)
+def _make_warning_event(session_id: str, message: str) -> str:
+    payload = {"type": "warning", "session_id": session_id, "ts": 0, "payload": {"message": message}}
+    return json.dumps(payload, ensure_ascii=False)
 
 
-async def _send_lifecycle(websocket: WebSocket, session_id: str, state: str) -> None:
-    # 기존 코드처럼 간단 lifecycle JSON 문자열로 전송(테스트/호환용)
-    await _send_text(
-        websocket,
-        json.dumps(
-            {
-                "type": "lifecycle",
-                "session_id": session_id,
-                "payload": {"state": state},
-            },
-            ensure_ascii=False,
-        ),
-    )
-
-
-async def _send_warning(
-    websocket: WebSocket,
-    session_id: str,
-    code: str,
-    message: str,
-    ts: Optional[int] = None,
-    extra: Optional[dict] = None,
-) -> None:
-    payload = {"code": code, "message": message}
-    if extra:
-        payload.update(extra)
-
-    # ts가 없으면 SessionManager 쪽 시간/seq를 쓰는 이벤트와 섞일 수 있어서,
-    # 여기서는 None이면 0으로 둠 (클라이언트에서 optional 처리 권장)
-    warn = WarningEvent(
-        session_id=session_id,
-        ts=ts or 0,
-        type="warning",
-        payload=payload,
-    )
-    await _send_text(websocket, warn.model_dump_json())
-
-
-def _ensure_session(session_id: str) -> None:
-    if session_manager.get_session(session_id) is None:
-        session_manager.create_session(session_id)
-
-
-async def _run_fake_stream_and_translation(websocket: WebSocket, session_id: str) -> None:
-    """
-    지금까지 해오던 fake_stt_stream -> (final이면) 번역 이벤트 + 실패시 warning
-    """
-    try:
-        for event in fake_stt_stream(session_id):
-            # STT 이벤트 먼저 전송
-            await _send_text(websocket, event.model_dump_json())
-
-            # final STT면 번역도 같이 전송
-            if getattr(event, "type", None) == "stt":
-                payload = event.payload or {}
-                is_final = bool(payload.get("is_final", False))
-                stt_text = payload.get("text", "")
-
-                if is_final:
-                    for target_lang in ("en", "zh"):
-                        tr = translate_text(stt_text, target_lang)
-                        # tr: {"ok": bool, "translated_text": str, "reason": str|None}
-                        tr_event = TranslationEvent(
-                            session_id=event.session_id,
-                            ts=event.ts,
-                            type="translation",
-                            payload={
-                                "source_lang": "ko",
-                                "target_lang": target_lang,
-                                "stt_text": stt_text,
-                                "translated_text": tr.get("translated_text", stt_text),
-                                "ok": bool(tr.get("ok", False)),
-                                "reason": tr.get("reason"),
-                            },
-                        )
-                        await _send_text(websocket, tr_event.model_dump_json())
-
-                        if not bool(tr.get("ok", False)):
-                            reason = tr.get("reason") or "translation_failed"
-                            code = reason if reason in ("translation_failed", "translation_uncertain") else "translation_failed"
-                            await _send_warning(
-                                websocket,
-                                session_id=event.session_id,
-                                code=code,
-                                message=f"translation issue for {target_lang}",
-                                ts=event.ts,
-                                extra={"target_lang": target_lang},
-                            )
-
-        # 스트림 끝나면 종료 처리
-        session_manager.end_session(session_id)
-
-    except WebSocketDisconnect:
-        # 스트리밍 도중 끊김 -> reconnecting
-        session_manager.mark_reconnecting(session_id)
-        print("[ws] disconnect during streaming -> reconnecting")
-        return
-
-
-def _validate_session_start_payload(obj: dict) -> Tuple[bool, str]:
-    """
-    사진의 session.start 형태 검증 (필수값/권장값)
-    """
-    audio = obj.get("audio") or {}
-    enc = audio.get("encoding")
-    sr = audio.get("sampleRateHz")
-    ch = audio.get("channels")
-
-    if enc != "LINEAR16":
-        return False, "audio.encoding must be LINEAR16"
-    if sr is None:
-        return False, "audio.sampleRateHz is required"
-    if ch is None:
-        return False, "audio.channels is required"
-    if not isinstance(sr, int) or sr <= 0:
-        return False, "audio.sampleRateHz must be positive int"
-    if ch not in (1, 2):
-        return False, "audio.channels must be 1 or 2"
-    return True, ""
-
-
-def _decode_audio_b64(audio_b64: str) -> Tuple[bool, bytes, str]:
-    """
-    audio 메시지의 base64는 WAV가 아니라 PCM bytes여야 한다는 전제.
-    여기서는 "받아서 디코드"만 하고, WAV 헤더 여부는 간단 체크로 경고만 준비.
-    """
-    try:
-        raw = base64.b64decode(audio_b64, validate=True)
-    except Exception:
-        return False, b"", "audioB64 base64 decode failed"
-
-    # WAV 헤더 흔적("RIFF", "WAVE") 있으면 거의 WAV 컨테이너로 보임 -> 경고용
-    if len(raw) >= 12 and raw[0:4] == b"RIFF" and raw[8:12] == b"WAVE":
-        return True, raw, "looks like WAV container (RIFF/WAVE). send PCM bytes, not WAV bytes"
-    return True, raw, ""
+def _make_error_event(session_id: str, message: str) -> str:
+    payload = {"type": "error", "session_id": session_id, "ts": 0, "payload": {"message": message}}
+    return json.dumps(payload, ensure_ascii=False)
 
 
 async def ws_stt_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
-    print("[ws] accepted")
+    print("[ws] accepted /ws/stt")
 
-    current_session_id: Optional[str] = None
+    loop = asyncio.get_running_loop()
+    current_session_id: str = "test-session"
+
+    bridge: Optional[GoogleStreamingSttBridge] = None
+    started_streaming = False
+
+    async def push_stt(text: str, is_final: bool) -> None:
+        try:
+            msg = _make_stt_event(current_session_id, text, is_final)
+            await _send_text(websocket, msg)
+        except Exception as e:
+            print("[ws] push_stt failed:", e)
+
+    def on_result(text: str, is_final: bool) -> None:
+        print(f"[gcp] result final={is_final} text={text!r}")
+        asyncio.create_task(push_stt(text, is_final))
+
+    def on_error(message: str) -> None:
+        print(f"[gcp] ERROR {message}")
+
+        async def _push_err():
+            try:
+                await _send_text(websocket, _make_error_event(current_session_id, message))
+            except Exception as e:
+                print("[ws] push_error failed:", e)
+
+        asyncio.create_task(_push_err())
 
     try:
         while True:
-            # 1) 메시지 수신
-            try:
-                msg = await websocket.receive_text()
-            except WebSocketDisconnect:
-                # 대기중 끊김
-                if current_session_id:
-                    session_manager.mark_reconnecting(current_session_id)
-                print("[ws] disconnect while waiting message")
-                return
+            raw = await websocket.receive_text()
+            msg = _safe_json_loads(raw)
+            if not msg:
+                print("[ws] non-json msg, ignoring")
+                continue
 
-            print("[ws] recv:", msg)
+            mtype = msg.get("type")
+            if not mtype:
+                print("[ws] missing type, ignoring:", msg.keys())
+                continue
 
-            # 2) JSON 메시지인지 먼저 시도
-            obj = _safe_json_loads(msg)
+            if mtype == "session.start":
+                current_session_id = msg.get("sessionId") or msg.get("session_id") or "test-session"
+                audio = msg.get("audio") or {}
 
-            # ------------------------------------------------------------------
-            # A) JSON 프로토콜 (사진에 나온 session.start / audio / session.end)
-            # ------------------------------------------------------------------
-            if isinstance(obj, dict) and "type" in obj:
-                mtype = obj.get("type")
+                encoding = audio.get("encoding", "LINEAR16")
+                sample_rate = int(audio.get("sampleRateHz", 16000))
+                channels = int(audio.get("channels", 1))
 
-                # session.start
-                if mtype == "session.start":
-                    session_id = obj.get("sessionId") or obj.get("session_id") or "test-session"
-                    current_session_id = session_id
+                print(f"[ws] session.start sid={current_session_id} fmt={encoding}/{sample_rate}/{channels}")
 
-                    ok, reason = _validate_session_start_payload(obj)
-                    _ensure_session(session_id)
-                    session_manager.start_streaming(session_id)
+                bridge = GoogleStreamingSttBridge(loop=loop, on_result=on_result, on_error=on_error)
 
-                    await _send_lifecycle(websocket, session_id, "streaming")
-
-                    if not ok:
-                        await _send_warning(
-                            websocket,
-                            session_id=session_id,
-                            code="bad_session_start",
-                            message=reason,
-                            extra={"expected": {"encoding": "LINEAR16", "sampleRateHz": "int", "channels": "1|2"}},
-                        )
-                    else:
-                        # sampleRateHz/channels 관련 “팀 충돌 포인트”를 서버가 명시적으로 안내
-                        audio = obj.get("audio") or {}
-                        sr = audio.get("sampleRateHz")
-                        ch = audio.get("channels")
-                        if ch == 2:
-                            await _send_warning(
-                                websocket,
-                                session_id=session_id,
-                                code="stereo_risk",
-                                message="channels=2 increases bandwidth/instability risk; prefer mono(1) for M1 stability",
-                                extra={"channels": ch, "sampleRateHz": sr},
-                            )
-
-                    # 지금 단계에서는 session.start만으로 fake stream을 자동 재생하진 않음
-                    # (팀에서 audio를 보내는 흐름과 충돌 줄이기)
+                try:
+                    bridge.set_audio_format(encoding=encoding, sample_rate_hz=sample_rate, channels=channels)
+                except Exception as e:
+                    err = f"Audio format invalid: {type(e).__name__}: {e}"
+                    print("[ws] " + err)
+                    await _send_text(websocket, _make_error_event(current_session_id, err))
+                    bridge = None
+                    started_streaming = False
                     continue
 
-                # audio (PCM base64 chunk)
-                if mtype == "audio":
-                    session_id = obj.get("sessionId") or obj.get("session_id") or (current_session_id or "test-session")
-                    current_session_id = session_id
-                    _ensure_session(session_id)
+                started_streaming = False
+                print("[ws] bridge prepared")
 
-                    audio_b64 = obj.get("audioB64") or obj.get("audio_b64") or ""
-                    seq = obj.get("seq")
-                    declared_bytes = obj.get("bytes")
-
-                    if not audio_b64:
-                        await _send_warning(
-                            websocket,
-                            session_id=session_id,
-                            code="missing_audio",
-                            message="audio.audioB64 is required",
-                            extra={"seq": seq},
-                        )
-                        continue
-
-                    ok, raw, wav_hint = _decode_audio_b64(audio_b64)
-                    if not ok:
-                        await _send_warning(
-                            websocket,
-                            session_id=session_id,
-                            code="bad_audio_base64",
-                            message="audioB64 decode failed",
-                            extra={"seq": seq},
-                        )
-                        continue
-
-                    if isinstance(declared_bytes, int) and declared_bytes != len(raw):
-                        await _send_warning(
-                            websocket,
-                            session_id=session_id,
-                            code="bytes_mismatch",
-                            message="declared bytes != decoded bytes length",
-                            extra={"declared": declared_bytes, "decoded": len(raw), "seq": seq},
-                        )
-
-                    if wav_hint:
-                        await _send_warning(
-                            websocket,
-                            session_id=session_id,
-                            code="wav_detected",
-                            message=wav_hint,
-                            extra={"seq": seq},
-                        )
-
-                    # 여기서 raw PCM을 Google Streaming STT로 흘려보내는 건 다음 단계(파이프 연결)에서 처리.
-                    # 지금은 “서버가 PCM 청크를 받을 수 있다” + “형식 검증/경고”까지만 확정.
-                    # 클라이언트가 연결 유지를 확인할 수 있도록 간단 ack 전송
+                if channels != 1:
                     await _send_text(
                         websocket,
-                        json.dumps(
-                            {
-                                "type": "audio.ack",
-                                "session_id": session_id,
-                                "payload": {"seq": seq, "bytes": len(raw)},
-                            },
-                            ensure_ascii=False,
-                        ),
+                        _make_warning_event(current_session_id, "channels!=1 (stereo). v0는 mono(1) 권장"),
+                    )
+                continue
+
+            if mtype == "audio":
+                if not bridge:
+                    await _send_text(websocket, _make_warning_event(current_session_id, "got audio before session.start"))
+                    continue
+
+                b64 = msg.get("audioB64") or msg.get("audio_b64")
+                if not b64:
+                    await _send_text(
+                        websocket,
+                        _make_warning_event(current_session_id, f"audio missing audioB64 keys={list(msg.keys())}"),
                     )
                     continue
 
-                # session.end
-                if mtype == "session.end":
-                    session_id = obj.get("sessionId") or obj.get("session_id") or (current_session_id or "test-session")
-                    current_session_id = session_id
-                    _ensure_session(session_id)
+                try:
+                    audio_bytes = _b64_to_bytes(b64)
+                    bytes_field = msg.get("bytes")
 
-                    session_manager.end_session(session_id)
-                    await _send_lifecycle(websocket, session_id, "ended")
-                    continue
+                    # 로그: 서버가 실제로 받았는지 확인용
+                    decoded_len = len(audio_bytes)
+                    if bytes_field:
+                        print(
+                            f"[ws] audio recv sid={current_session_id} bytes_field={bytes_field} decoded={decoded_len}"
+                        )
+                    else:
+                        print(f"[ws] audio recv sid={current_session_id} decoded={decoded_len}")
 
-                # unknown JSON type
-                session_id = obj.get("sessionId") or obj.get("session_id") or (current_session_id or "test-session")
-                await _send_warning(
-                    websocket,
-                    session_id=session_id,
-                    code="unknown_message_type",
-                    message=f"unknown type: {mtype}",
-                )
+                    if RECORD_THEN_SEND:
+                        # ✅ 한 방에 받은 WAV/PCM을 단발 recognize로 처리
+                        print("[ws] recognize_once (record-then-send mode)")
+                        await asyncio.to_thread(bridge.recognize_once, audio_bytes)
+                        print("[ws] recognize_once done")
+                        continue
+
+                    # ✅ streaming 모드 (나중에 Flutter가 chunk로 보내면 사용)
+                    if not started_streaming:
+                        bridge.start_streaming_thread()
+                        started_streaming = True
+                        print("[ws] streaming thread started")
+
+                    dec_len, was_wav = bridge.enqueue_audio_bytes(audio_bytes)
+                    print(f"[ws] audio enqueue sid={current_session_id} decoded={dec_len} was_wav={was_wav}")
+
+                except Exception as e:
+                    err = f"audio decode/enqueue failed: {type(e).__name__}: {e}"
+                    print("[ws] " + err)
+                    await _send_text(websocket, _make_error_event(current_session_id, err))
                 continue
 
-            # ------------------------------------------------------------------
-            # B) 기존 텍스트 프로토콜 (start/stop/echo)
-            # ------------------------------------------------------------------
-            # start / start:<session_id>
-            if msg.startswith("start"):
-                _, session_id = _parse_start_text(msg)
-                current_session_id = session_id
-
-                _ensure_session(session_id)
-                session_manager.start_streaming(session_id)
-
-                # 시작 알림
-                await _send_lifecycle(websocket, session_id, "streaming")
-
-                # 기존처럼 start 치면 fake STT + 번역까지 한번에 쏴주는 동작 유지
-                await _run_fake_stream_and_translation(websocket, session_id)
+            if mtype == "session.end":
+                print(f"[ws] session.end sid={current_session_id}")
+                if bridge:
+                    bridge.stop()
+                await _send_text(websocket, json.dumps({"type": "session.ended", "session_id": current_session_id}))
                 continue
 
-            # stop / stop:<session_id>
-            if msg.startswith("stop"):
-                _, session_id = _parse_stop_text(msg, current_session_id or "test-session")
-                current_session_id = session_id
-
-                session_manager.end_session(session_id)
-                await _send_lifecycle(websocket, session_id, "ended")
-                continue
-
-            # 기본 echo
-            await _send_text(websocket, msg)
+            print("[ws] unknown type:", mtype)
 
     except WebSocketDisconnect:
-        if current_session_id:
-            session_manager.mark_reconnecting(current_session_id)
         print("[ws] disconnect")
-        return
-
     except Exception as e:
-        print("[ws] exception:", repr(e))
+        print("[ws] fatal error:", type(e).__name__, e)
         traceback.print_exc()
+    finally:
         try:
-            await websocket.close(code=1011)
+            if bridge:
+                bridge.stop()
+        except Exception:
+            pass
+        try:
+            await websocket.close()
         except Exception:
             pass

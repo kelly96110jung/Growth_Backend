@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import queue
 import threading
 import wave
@@ -10,6 +11,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from google.cloud import speech_v1 as speech
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\82107\Downloads\medexplain-stt-13e7cf056287.json"
+
 
 
 @dataclass

@@ -32,23 +32,78 @@ def _b64_to_bytes(b64: str) -> bytes:
     return base64.b64decode(b64)
 
 
+def _translate_text_mock(text: str, target_lang: str) -> str:
+    text = (text or "").strip()
+
+    if not text:
+        return text
+
+    if target_lang == "en":
+        return f"[EN] {text}"
+    if target_lang == "zh":
+        return f"[ZH] {text}"
+
+    return text
+
+
 def _make_stt_event(session_id: str, text: str, is_final: bool) -> str:
     payload = {
         "type": "stt",
         "session_id": session_id,
         "ts": 0,
-        "payload": {"text": text, "is_final": bool(is_final)},
+        "payload": {
+            "text": text,
+            "is_final": bool(is_final),
+        },
     }
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _make_translation_event(
+    session_id: str,
+    source_lang: str,
+    target_lang: str,
+    stt_text: str,
+    translated_text: str,
+    ok: bool,
+    reason: Optional[str] = None,
+) -> str:
+    payload = {
+        "type": "translation",
+        "session_id": session_id,
+        "ts": 0,
+        "payload": {
+            "source_lang": source_lang,
+            "target_lang": target_lang,
+            "stt_text": stt_text,
+            "translated_text": translated_text,
+            "ok": ok,
+        },
+    }
+
+    if reason is not None:
+        payload["payload"]["reason"] = reason
+
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _make_warning_event(session_id: str, message: str) -> str:
-    payload = {"type": "warning", "session_id": session_id, "ts": 0, "payload": {"message": message}}
+    payload = {
+        "type": "warning",
+        "session_id": session_id,
+        "ts": 0,
+        "payload": {"message": message},
+    }
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _make_error_event(session_id: str, message: str) -> str:
-    payload = {"type": "error", "session_id": session_id, "ts": 0, "payload": {"message": message}}
+    payload = {
+        "type": "error",
+        "session_id": session_id,
+        "ts": 0,
+        "payload": {"message": message},
+    }
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -66,17 +121,54 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
         try:
             msg = _make_stt_event(current_session_id, text, is_final)
             await _send_text(websocket, msg)
+            print(f"[ws] pushed stt final={is_final} text={text!r}")
         except Exception as e:
             print("[ws] push_stt failed:", e)
+
+    async def push_translation(stt_text: str, target_lang: str) -> None:
+        try:
+            translated_text = _translate_text_mock(stt_text, target_lang)
+
+            msg = _make_translation_event(
+                session_id=current_session_id,
+                source_lang="ko",
+                target_lang=target_lang,
+                stt_text=stt_text,
+                translated_text=translated_text,
+                ok=True,
+            )
+            await _send_text(websocket, msg)
+            print(f"[ws] pushed translation target={target_lang} text={translated_text!r}")
+
+        except Exception as e:
+            print("[ws] push_translation failed:", e)
+
+            try:
+                fail_msg = _make_translation_event(
+                    session_id=current_session_id,
+                    source_lang="ko",
+                    target_lang=target_lang,
+                    stt_text=stt_text,
+                    translated_text=stt_text,
+                    ok=False,
+                    reason="translation_failed",
+                )
+                await _send_text(websocket, fail_msg)
+            except Exception as inner_e:
+                print("[ws] push_translation fallback failed:", inner_e)
 
     def on_result(text: str, is_final: bool) -> None:
         print(f"[gcp] result final={is_final} text={text!r}")
         asyncio.create_task(push_stt(text, is_final))
 
+        if is_final and text and text.strip():
+            asyncio.create_task(push_translation(text, "en"))
+            asyncio.create_task(push_translation(text, "zh"))
+
     def on_error(message: str) -> None:
         print(f"[gcp] ERROR {message}")
 
-        async def _push_err():
+        async def _push_err() -> None:
             try:
                 await _send_text(websocket, _make_error_event(current_session_id, message))
             except Exception as e:
@@ -107,10 +199,18 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
 
                 print(f"[ws] session.start sid={current_session_id} fmt={encoding}/{sample_rate}/{channels}")
 
-                bridge = GoogleStreamingSttBridge(loop=loop, on_result=on_result, on_error=on_error)
+                bridge = GoogleStreamingSttBridge(
+                    loop=loop,
+                    on_result=on_result,
+                    on_error=on_error,
+                )
 
                 try:
-                    bridge.set_audio_format(encoding=encoding, sample_rate_hz=sample_rate, channels=channels)
+                    bridge.set_audio_format(
+                        encoding=encoding,
+                        sample_rate_hz=sample_rate,
+                        channels=channels,
+                    )
                 except Exception as e:
                     err = f"Audio format invalid: {type(e).__name__}: {e}"
                     print("[ws] " + err)
@@ -125,20 +225,29 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
                 if channels != 1:
                     await _send_text(
                         websocket,
-                        _make_warning_event(current_session_id, "channels!=1 (stereo). v0는 mono(1) 권장"),
+                        _make_warning_event(
+                            current_session_id,
+                            "channels!=1 (stereo). v0는 mono(1) 권장",
+                        ),
                     )
                 continue
 
             if mtype == "audio":
                 if not bridge:
-                    await _send_text(websocket, _make_warning_event(current_session_id, "got audio before session.start"))
+                    await _send_text(
+                        websocket,
+                        _make_warning_event(current_session_id, "got audio before session.start"),
+                    )
                     continue
 
                 b64 = msg.get("audioB64") or msg.get("audio_b64")
                 if not b64:
                     await _send_text(
                         websocket,
-                        _make_warning_event(current_session_id, f"audio missing audioB64 keys={list(msg.keys())}"),
+                        _make_warning_event(
+                            current_session_id,
+                            f"audio missing audioB64 keys={list(msg.keys())}",
+                        ),
                     )
                     continue
 
@@ -146,23 +255,21 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
                     audio_bytes = _b64_to_bytes(b64)
                     bytes_field = msg.get("bytes")
 
-                    # 로그: 서버가 실제로 받았는지 확인용
                     decoded_len = len(audio_bytes)
                     if bytes_field:
                         print(
-                            f"[ws] audio recv sid={current_session_id} bytes_field={bytes_field} decoded={decoded_len}"
+                            f"[ws] audio recv sid={current_session_id} "
+                            f"bytes_field={bytes_field} decoded={decoded_len}"
                         )
                     else:
                         print(f"[ws] audio recv sid={current_session_id} decoded={decoded_len}")
 
                     if RECORD_THEN_SEND:
-                        # ✅ 한 방에 받은 WAV/PCM을 단발 recognize로 처리
                         print("[ws] recognize_once (record-then-send mode)")
                         await asyncio.to_thread(bridge.recognize_once, audio_bytes)
                         print("[ws] recognize_once done")
                         continue
 
-                    # ✅ streaming 모드 (나중에 Flutter가 chunk로 보내면 사용)
                     if not started_streaming:
                         bridge.start_streaming_thread()
                         started_streaming = True
@@ -181,7 +288,16 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
                 print(f"[ws] session.end sid={current_session_id}")
                 if bridge:
                     bridge.stop()
-                await _send_text(websocket, json.dumps({"type": "session.ended", "session_id": current_session_id}))
+                await _send_text(
+                    websocket,
+                    json.dumps(
+                        {
+                            "type": "session.ended",
+                            "session_id": current_session_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
                 continue
 
             print("[ws] unknown type:", mtype)

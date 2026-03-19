@@ -51,10 +51,8 @@ def _make_stt_event(session_id: str, text: str, is_final: bool) -> str:
         "type": "stt",
         "session_id": session_id,
         "ts": 0,
-        "payload": {
-            "text": text,
-            "is_final": bool(is_final),
-        },
+        "text": text,
+        "isFinal": bool(is_final),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -69,20 +67,18 @@ def _make_translation_event(
     reason: Optional[str] = None,
 ) -> str:
     payload = {
-        "type": "translation",
+        "type": "translate",
         "session_id": session_id,
         "ts": 0,
-        "payload": {
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "stt_text": stt_text,
-            "translated_text": translated_text,
-            "ok": ok,
-        },
+        "target": target_lang,
+        "text": translated_text,
+        "needsConfirm": not ok,
+        "sourceLang": source_lang,
+        "sttText": stt_text,
     }
 
     if reason is not None:
-        payload["payload"]["reason"] = reason
+        payload["reason"] = reason
 
     return json.dumps(payload, ensure_ascii=False)
 
@@ -159,22 +155,40 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
 
     def on_result(text: str, is_final: bool) -> None:
         print(f"[gcp] result final={is_final} text={text!r}")
-        asyncio.create_task(push_stt(text, is_final))
-
+        
+        try:
+            fut = asyncio.run_coroutine_threadsafe(push_stt(text, is_final), loop)
+            fut.result(timeout=5)
+        except Exception as e:
+            print("[ws] push_stt thread-safe failed:", e)
+            
         if is_final and text and text.strip():
-            asyncio.create_task(push_translation(text, "en"))
-            asyncio.create_task(push_translation(text, "zh"))
+            try:
+                fut_en = asyncio.run_coroutine_threadsafe(push_translation(text, "en"), loop)
+                fut_en.result(timeout=5)
+            except Exception as e:
+                print("[ws] push_translation en failed:", e)
+
+            try:
+                fut_zh = asyncio.run_coroutine_threadsafe(push_translation(text, "zh"), loop)
+                fut_zh.result(timeout=5)
+            except Exception as e:
+                print("[ws] push_translation zh failed:", e)
 
     def on_error(message: str) -> None:
         print(f"[gcp] ERROR {message}")
-
+        
         async def _push_err() -> None:
             try:
                 await _send_text(websocket, _make_error_event(current_session_id, message))
             except Exception as e:
                 print("[ws] push_error failed:", e)
-
-        asyncio.create_task(_push_err())
+                
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_push_err(), loop)
+            fut.result(timeout=5)
+        except Exception as e:
+            print("[ws] push_error thread-safe failed:", e)
 
     try:
         while True:

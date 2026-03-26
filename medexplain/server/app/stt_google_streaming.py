@@ -15,7 +15,6 @@ from google.cloud import speech_v1 as speech
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\82107\Downloads\medexplain-stt-13e7cf056287.json"
 
 
-
 @dataclass
 class AudioFormat:
     encoding: str  # "LINEAR16"
@@ -43,11 +42,83 @@ def wav_bytes_to_pcm16(raw_wav: bytes) -> tuple[bytes, AudioFormat]:
     return pcm, AudioFormat(encoding="LINEAR16", sample_rate_hz=sample_rate, channels=channels)
 
 
+def _medical_phrase_hints() -> list[str]:
+    return [
+        "CRP",
+        "씨알피",
+        "CBC",
+        "씨비씨",
+        "CT",
+        "씨티",
+        "MRI",
+        "엠알아이",
+        "PET CT",
+        "PET-CT",
+        "펫시티",
+        "biopsy",
+        "바이옵시",
+        "endoscopy",
+        "엔도스코피",
+        "gastroscopy",
+        "가스트로스코피",
+        "gastrectomy",
+        "가스트렉토미",
+        "chemotherapy",
+        "케모테라피",
+        "radiotherapy",
+        "라디오테라피",
+        "adenocarcinoma",
+        "아데노카르시노마",
+        "gastric adenocarcinoma",
+        "가스트릭 아데노카르시노마",
+        "carcinoma",
+        "카르시노마",
+        "metastasis",
+        "메타스타시스",
+        "lymph node",
+        "림프 노드",
+        "lymph nodes",
+        "림프 노드들",
+        "lymphatic invasion",
+        "림프 침범",
+        "cancer",
+        "캔서",
+        "stomach cancer",
+        "스토막 캔서",
+        "위선암",
+        "위암",
+        "조직 검사",
+        "내시경",
+        "항암화학요법",
+        "방사선 치료",
+        "림프절",
+    ]
+
+
+def _build_recognition_config(sample_rate: int, channels: int) -> speech.RecognitionConfig:
+    """
+    공통 RecognitionConfig 생성
+    - 한국어 기반 유지
+    - 영어 의료용어 phrase hints 추가
+    """
+    speech_context = speech.SpeechContext(
+        phrases=_medical_phrase_hints(),
+        boost=25.0,
+    )
+
+    return speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=sample_rate,
+        language_code="ko-KR",
+        enable_automatic_punctuation=True,
+        audio_channel_count=channels,
+        model="latest_long",
+        use_enhanced=True,
+        speech_contexts=[speech_context],
+    )
+
+
 class GoogleStreamingSttBridge:
-    """
-    ✅ record-then-send(한 방에 WAV 전송)도 동작하도록 "단발 recognize" 지원
-    ✅ streaming 모드(쪼개서 보내기)도 그대로 지원
-    """
 
     def __init__(
         self,
@@ -86,11 +157,6 @@ class GoogleStreamingSttBridge:
         self._q.put(None)
 
     def enqueue_audio_bytes(self, raw: bytes) -> tuple[int, bool]:
-        """
-        raw가 WAV면 PCM으로 풀어서 넣고,
-        raw가 PCM이면 그대로 넣음.
-        return: (decoded_len, was_wav)
-        """
         was_wav = False
         if _looks_like_wav(raw):
             was_wav = True
@@ -112,7 +178,6 @@ class GoogleStreamingSttBridge:
             if _looks_like_wav(raw):
                 pcm, fmt_from_wav = wav_bytes_to_pcm16(raw)
                 pcm_bytes = pcm
-                # WAV에서 읽은 sample_rate/ch가 session.start와 다르면, WAV 값을 우선 적용해도 됨
                 sample_rate = fmt_from_wav.sample_rate_hz
                 channels = fmt_from_wav.channels
             else:
@@ -120,16 +185,7 @@ class GoogleStreamingSttBridge:
                 sample_rate = self._fmt.sample_rate_hz
                 channels = self._fmt.channels
 
-            # v0: stereo는 인식이 흔들릴 수 있어 mono 권장
-            config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=sample_rate,
-                language_code="ko-KR",
-                enable_automatic_punctuation=True,
-                audio_channel_count=channels,
-                model="latest_long",
-                use_enhanced=True,
-            )
+            config = _build_recognition_config(sample_rate, channels)
             audio = speech.RecognitionAudio(content=pcm_bytes)
 
             client = speech.SpeechClient()
@@ -157,11 +213,6 @@ class GoogleStreamingSttBridge:
         self.loop.call_soon_threadsafe(self.on_error, msg)
 
     def _request_generator(self):
-        """
-        Google streaming_recognize 요구사항:
-        - 첫 request에 streaming_config 포함
-        - 이후 audio_content들을 "가까운 실시간"으로 흘려보내야 안정적
-        """
         first = self._q.get()
         if first is None:
             return
@@ -169,12 +220,9 @@ class GoogleStreamingSttBridge:
         if not self._fmt:
             raise RuntimeError("Audio format is not set. Call set_audio_format() after session.start.")
 
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=self._fmt.sample_rate_hz,
-            language_code="ko-KR",
-            enable_automatic_punctuation=True,
-            audio_channel_count=self._fmt.channels,
+        config = _build_recognition_config(
+            sample_rate=self._fmt.sample_rate_hz,
+            channels=self._fmt.channels,
         )
 
         streaming_config = speech.StreamingRecognitionConfig(
@@ -196,7 +244,6 @@ class GoogleStreamingSttBridge:
         try:
             client = speech.SpeechClient()
 
-            # ✅ 반드시 keyword로 requests= 를 써야 이상한 helper 경로로 안 샘
             responses = client.streaming_recognize(requests=self._request_generator())
 
             for resp in responses:

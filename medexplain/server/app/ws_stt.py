@@ -10,9 +10,6 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from app.stt_google_streaming import GoogleStreamingSttBridge
 
-
-# ✅ 지금 Flutter가 "녹음 끝나고 WAV 한 번에 전송"이면 True 유지
-# 나중에 "쪼개서 실시간 전송"으로 바꾸면 False로 바꾸면 됨
 RECORD_THEN_SEND = True
 
 
@@ -103,6 +100,10 @@ def _make_error_event(session_id: str, message: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _is_empty_stt_text(text: Optional[str]) -> bool:
+    return not text or not text.strip()
+
+
 async def ws_stt_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     print("[ws] accepted /ws/stt")
@@ -153,42 +154,49 @@ async def ws_stt_endpoint(websocket: WebSocket) -> None:
             except Exception as inner_e:
                 print("[ws] push_translation fallback failed:", inner_e)
 
+    async def push_warning(message: str) -> None:
+        try:
+            msg = _make_warning_event(current_session_id, message)
+            await _send_text(websocket, msg)
+            print(f"[ws] pushed warning message={message!r}")
+        except Exception as e:
+            print("[ws] push_warning failed:", e)
+
+    def submit_coro(coro, label: str) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception as e:
+            print(f"[ws] submit {label} failed:", e)
+
     def on_result(text: str, is_final: bool) -> None:
         print(f"[gcp] result final={is_final} text={text!r}")
-        
-        try:
-            fut = asyncio.run_coroutine_threadsafe(push_stt(text, is_final), loop)
-            fut.result(timeout=5)
-        except Exception as e:
-            print("[ws] push_stt thread-safe failed:", e)
-            
-        if is_final and text and text.strip():
-            try:
-                fut_en = asyncio.run_coroutine_threadsafe(push_translation(text, "en"), loop)
-                fut_en.result(timeout=5)
-            except Exception as e:
-                print("[ws] push_translation en failed:", e)
 
-            try:
-                fut_zh = asyncio.run_coroutine_threadsafe(push_translation(text, "zh"), loop)
-                fut_zh.result(timeout=5)
-            except Exception as e:
-                print("[ws] push_translation zh failed:", e)
+        # 결과 전송은 submit만 하고 기다리지 않음
+        submit_coro(push_stt(text, is_final), "push_stt")
+
+        # final인데 텍스트가 비어 있으면 warning 전송
+        if is_final and _is_empty_stt_text(text):
+            submit_coro(
+                push_warning("음성이 인식되지 않았습니다. 다시 녹음해주세요."),
+                "push_warning",
+            )
+            return
+
+        # final이고 텍스트가 있으면 번역 진행
+        if is_final:
+            submit_coro(push_translation(text, "en"), "push_translation_en")
+            submit_coro(push_translation(text, "zh"), "push_translation_zh")
 
     def on_error(message: str) -> None:
         print(f"[gcp] ERROR {message}")
-        
+
         async def _push_err() -> None:
             try:
                 await _send_text(websocket, _make_error_event(current_session_id, message))
             except Exception as e:
                 print("[ws] push_error failed:", e)
-                
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_push_err(), loop)
-            fut.result(timeout=5)
-        except Exception as e:
-            print("[ws] push_error thread-safe failed:", e)
+
+        submit_coro(_push_err(), "push_error")
 
     try:
         while True:

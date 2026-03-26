@@ -29,17 +29,95 @@ def save_records(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+def _is_blank_text(text: str) -> bool:
+    return not text or not text.strip()
+
+
+def _normalize_summary(summary):
+    if summary is None:
+        return ["요약이 생성되지 않았습니다."]
+
+    if isinstance(summary, list):
+        cleaned = [str(item).strip() for item in summary if str(item).strip()]
+        return cleaned if cleaned else ["요약이 생성되지 않았습니다."]
+
+    text = str(summary).strip()
+    return [text] if text else ["요약이 생성되지 않았습니다."]
+
+
+def _normalize_terms_for_save(terms):
+    if not terms:
+        return []
+
+    normalized = []
+    for term in terms:
+        if hasattr(term, "model_dump"):
+            item = term.model_dump()
+        else:
+            item = dict(term)
+
+        term_text = str(item.get("term", "")).strip()
+        easy_text = str(item.get("easy", "")).strip()
+
+        if not term_text:
+            continue
+
+        normalized.append(
+            {
+                "term": term_text,
+                # 기존 저장 구조 유지
+                "easy": easy_text,
+                # 상세 조회 response_model 호환용
+                "description": easy_text,
+            }
+        )
+
+    return normalized
+
+
+def _normalize_terms_for_detail(terms):
+    if not terms:
+        return []
+
+    normalized = []
+    for item in terms:
+        term_text = str(item.get("term", "")).strip()
+        description = str(
+            item.get("description")
+            or item.get("easy")
+            or ""
+        ).strip()
+
+        if not term_text:
+            continue
+
+        normalized.append(
+            {
+                "term": term_text,
+                "description": description,
+            }
+        )
+
+    return normalized
+
+
 @router.post("/records")
 def create_record(request: RecordCreateRequest):
+    if _is_blank_text(request.clean_text):
+        raise HTTPException(
+            status_code=400,
+            detail="저장할 수 있는 음성 인식 결과가 없습니다."
+        )
+
     records = load_records()
 
     new_record = {
         "record_id": str(uuid.uuid4()),
         "date": request.date,
         "department": request.department,
-        "clean_text": request.clean_text,
-        "summary": request.summary,
-        "terms": [term.model_dump() for term in request.terms],
+        "clean_text": request.clean_text.strip(),
+        "summary": _normalize_summary(request.summary),
+        "terms": _normalize_terms_for_save(request.terms),
     }
 
     records.append(new_record)
@@ -83,8 +161,8 @@ def get_record_detail(record_id: str):
                 date=record["date"],
                 department=record["department"],
                 clean_text=record["clean_text"],
-                summary=record["summary"],
-                terms=record["terms"],
+                summary=record.get("summary", []),
+                terms=_normalize_terms_for_detail(record.get("terms", [])),
             )
 
     raise HTTPException(status_code=404, detail="Record not found")

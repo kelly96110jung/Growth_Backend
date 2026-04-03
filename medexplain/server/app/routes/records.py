@@ -57,7 +57,7 @@ def _normalize_terms_for_save(terms):
             item = dict(term)
 
         term_text = str(item.get("term", "")).strip()
-        easy_text = str(item.get("easy", "")).strip()
+        easy_text = str(item.get("description", "") or item.get("easy", "")).strip()
 
         if not term_text:
             continue

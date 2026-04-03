@@ -1,9 +1,13 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, WebSocket
 from pydantic import BaseModel
 from typing import List
 from app.routes.summary import router as summary_router
 from app.routes.explain import router as explain_router
 from app.routes.records import router as records_router
+from app.routes.questions import router as questions_router
 import re
 import json
 import asyncio
@@ -56,6 +60,7 @@ app = FastAPI()
 app.include_router(summary_router)
 app.include_router(explain_router)
 app.include_router(records_router)
+app.include_router(questions_router)
 
 @app.on_event("startup")
 async def on_startup():
